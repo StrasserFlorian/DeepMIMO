@@ -27,6 +27,7 @@ manuals/*
 *.npy
 api_keys.py
 .DS_Store
+.idea/
 .vscode
 .coverage
 coverage.xml
