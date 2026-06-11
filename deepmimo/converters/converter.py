@@ -5,10 +5,11 @@ data from various supported formats (AODT, Sionna RT, Wireless Insite) into
 a standardized scenario format.
 """
 
+from __future__ import annotations
+
 # Standard library imports
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 # Local imports
 from deepmimo import consts as c
@@ -17,6 +18,9 @@ from . import converter_utils as cu
 from .aodt.aodt_converter import aodt_rt_converter
 from .sionna_rt.sionna_converter import sionna_rt_converter
 from .wireless_insite.insite_converter import insite_rt_converter
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _find_converter_from_dir(directory: str) -> Callable | None:
@@ -58,7 +62,10 @@ def convert(path_to_rt_folder: str, **conversion_params: dict[str, Any]) -> str 
         path_to_rt_folder (str): Path to the folder containing raytracing data.
                                  If the folder contains multiple scenes, the function will
                                  sort them with sorted() and convert each folder to a time snapshot.
-        **conversion_params (dict[str, Any]): Additional parameters for the conversion process
+        **conversion_params (dict[str, Any]): Additional parameters for the conversion process.
+            Forwarded verbatim to the selected ray-tracer converter. Notably,
+            ``lossless=True`` requests the lossless triangular-mesh scene export
+            (default is the compact convex-hull representation).
 
     Returns:
         Optional[Any]: Scenario object if conversion is successful, None otherwise

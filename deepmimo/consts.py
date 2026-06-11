@@ -74,14 +74,18 @@ LOAD_PARAMS_PARAM_NAME = "load_params"
 RAYTRACER_NAME_WIRELESS_INSITE = "Remcom Wireless Insite"
 RAYTRACER_VERSION_WIRELESS_INSITE = "3.3.0"
 RAYTRACER_NAME_SIONNA = "Sionna Ray Tracing"
-RAYTRACER_VERSION_SIONNA = "0.19.2"
+RAYTRACER_VERSION_SIONNA = "2.0.1"
 RAYTRACER_NAME_AODT = "Aerial Omniverse Digital Twin"
 RAYTRACER_VERSION_AODT = "1.x"
 
-SUPPORTED_RAYTRACERS = [RAYTRACER_NAME_WIRELESS_INSITE, RAYTRACER_NAME_SIONNA]
+SUPPORTED_RAYTRACERS = [
+    RAYTRACER_NAME_WIRELESS_INSITE,
+    RAYTRACER_NAME_SIONNA,
+    RAYTRACER_NAME_AODT,
+]
 SUPPORTED_WIRELESS_INSITE_VERSIONS = ["3.3.x", "4.0.x"]  # Check 3.4.x
-SUPPORTED_SIONNA_VERSIONS = ["0.19.1", "0.19.2", "1.0.2"]  # Expand to 1.0.x
-SUPPORTED_AODT_VERSIONS = []
+SUPPORTED_SIONNA_VERSIONS = ["2.0.x", "2.1.x"]
+SUPPORTED_AODT_VERSIONS = ["1.x"]
 
 # ==============================================================================
 # 2. Ray-Tracing Parameters
@@ -137,6 +141,15 @@ SCENE_PARAM_N_OBJECTS = "n_objects"
 SCENE_PARAM_N_VERTICES = "n_vertices"
 SCENE_PARAM_N_FACES = "n_faces"
 SCENE_PARAM_N_TRIANGULAR_FACES = "n_triangular_faces"
+
+# Scene geometry representation (how object faces are stored on disk)
+SCENE_PARAM_REPRESENTATION = "representation"
+SCENE_REPRESENTATION_HULL = "hull"  # Default/legacy convex-hull simplification
+SCENE_REPRESENTATION_MESH = "mesh"  # Lossless triangular mesh (preserves geometry)
+
+# Filenames for the lossless triangular-mesh representation
+SCENE_MESH_FACES_FILENAME = "faces.npz"  # Per-object (N_tri, 3) vertex-index arrays
+SCENE_MESH_MATERIALS_FILENAME = "materials.npz"  # Per-object (N_tri,) material-index arrays
 
 # ==============================================================================
 # 4. Materials Parameters

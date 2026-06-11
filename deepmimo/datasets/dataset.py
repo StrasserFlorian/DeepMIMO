@@ -49,7 +49,6 @@ from deepmimo.datasets.sampling import (
     get_linear_idxs,
     get_uniform_idxs,
 )
-from deepmimo.datasets.summary import plot_summary
 from deepmimo.datasets.visualization import (
     generate_distinct_colors,
     plot_coverage,
@@ -80,6 +79,196 @@ SHARED_PARAMS = [
     c.LOAD_PARAMS_PARAM_NAME,
     c.RT_PARAMS_PARAM_NAME,
 ]
+
+
+# Memory budget (number of (point, triangle) pairs) per vectorized chunk used
+# when assigning interaction points to the nearest triangular face in lossless
+# mesh scenes. Caps the transient [chunk, n_triangles, 3] arrays regardless of
+# how many interaction points / triangles the scene contains.
+_POINT_TRIANGLE_PAIR_BUDGET = 4_000_000
+
+
+def _gather_object_triangles(
+    objects: list,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Collect every triangular face of ``objects`` into flat vertex arrays.
+
+    Args:
+        objects: Physical elements whose triangular faces should be gathered.
+
+    Returns:
+        tuple of (v0, v1, v2, tri_obj_ids):
+            - v0, v1, v2: ``(T, 3)`` float arrays holding the three vertices of
+              each of the ``T`` triangles.
+            - tri_obj_ids: ``(T,)`` int array mapping each triangle to the
+              ``object_id`` of the element that owns it.
+
+    """
+    tris_per_obj: list[np.ndarray] = []
+    obj_ids_per_obj: list[np.ndarray] = []
+    for obj in objects:
+        obj_tris = [tri for face in obj.faces for tri in face.triangular_faces]
+        if not obj_tris:
+            continue
+        obj_tris_arr = np.asarray(obj_tris, dtype=float)  # (t, 3, 3)
+        tris_per_obj.append(obj_tris_arr)
+        obj_ids_per_obj.append(np.full(len(obj_tris_arr), obj.object_id, dtype=int))
+    if not tris_per_obj:
+        empty = np.zeros((0, 3), dtype=float)
+        return empty, empty, empty, np.zeros((0,), dtype=int)
+    tris = np.concatenate(tris_per_obj, axis=0)  # (T, 3, 3)
+    tri_obj_ids = np.concatenate(obj_ids_per_obj)  # (T,)
+    return tris[:, 0, :], tris[:, 1, :], tris[:, 2, :], tri_obj_ids
+
+
+def _point_segment_distances(points: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Distance from each point to each segment ``[a, b]`` (vectorized).
+
+    Args:
+        points: ``(P, 3)`` query points.
+        a: ``(T, 3)`` segment start vertices.
+        b: ``(T, 3)`` segment end vertices.
+
+    Returns:
+        ``(P, T)`` array of point-to-segment distances.
+
+    """
+    ab = b - a  # (T, 3)
+    ab_len2 = np.einsum("tj,tj->t", ab, ab)  # (T,)
+    safe_len2 = np.where(ab_len2 > 0.0, ab_len2, 1.0)
+    ap = points[:, None, :] - a[None, :, :]  # (P, T, 3)
+    t = np.einsum("ptj,tj->pt", ap, ab) / safe_len2  # (P, T)
+    t = np.clip(t, 0.0, 1.0)
+    closest = a[None, :, :] + t[:, :, None] * ab[None, :, :]  # (P, T, 3)
+    return np.linalg.norm(points[:, None, :] - closest, axis=2)  # (P, T)
+
+
+def _point_triangle_distances(
+    points: np.ndarray, v0: np.ndarray, v1: np.ndarray, v2: np.ndarray
+) -> np.ndarray:
+    """Exact Euclidean distance from each point to each triangle (vectorized).
+
+    The closest point of a triangle to an external query point is either the
+    orthogonal projection onto the triangle plane (when that projection lands
+    inside the triangle) or a point on one of its three edges. Both candidates
+    are computed and selected per (point, triangle) pair, yielding the exact
+    point-to-triangle distance (not an approximation).
+
+    Args:
+        points: ``(P, 3)`` query points.
+        v0: ``(T, 3)`` first triangle vertices.
+        v1: ``(T, 3)`` second triangle vertices.
+        v2: ``(T, 3)`` third triangle vertices.
+
+    Returns:
+        ``(P, T)`` array of exact point-to-triangle distances.
+
+    """
+    eps = 1e-12
+    ab = v1 - v0  # (T, 3)
+    ac = v2 - v0  # (T, 3)
+    d00 = np.einsum("tj,tj->t", ab, ab)  # (T,)
+    d01 = np.einsum("tj,tj->t", ab, ac)  # (T,)
+    d11 = np.einsum("tj,tj->t", ac, ac)  # (T,)
+    denom = d00 * d11 - d01 * d01  # (T,)
+    non_degenerate = np.abs(denom) > eps  # (T,)
+    safe_denom = np.where(non_degenerate, denom, 1.0)
+
+    ap = points[:, None, :] - v0[None, :, :]  # (P, T, 3)
+    d20 = np.einsum("ptj,tj->pt", ap, ab)  # (P, T)
+    d21 = np.einsum("ptj,tj->pt", ap, ac)  # (P, T)
+    # Barycentric coordinates of the in-plane projection of each point.
+    bary_v = (d11 * d20 - d01 * d21) / safe_denom  # (P, T)
+    bary_w = (d00 * d21 - d01 * d20) / safe_denom  # (P, T)
+    bary_u = 1.0 - bary_v - bary_w  # (P, T)
+    inside = (bary_u >= 0) & (bary_v >= 0) & (bary_w >= 0) & non_degenerate[None, :]
+
+    normal = np.cross(ab, ac)  # (T, 3)
+    normal_len = np.linalg.norm(normal, axis=1)  # (T,)
+    safe_normal_len = np.where(normal_len > eps, normal_len, 1.0)
+    unit_normal = normal / safe_normal_len[:, None]  # (T, 3)
+    dist_plane = np.abs(np.einsum("ptj,tj->pt", ap, unit_normal))  # (P, T)
+
+    edge_dist = np.minimum(
+        np.minimum(
+            _point_segment_distances(points, v0, v1),
+            _point_segment_distances(points, v1, v2),
+        ),
+        _point_segment_distances(points, v2, v0),
+    )  # (P, T)
+    return np.where(inside, dist_plane, edge_dist)
+
+
+def _nearest_triangle_object_ids(  # noqa: PLR0913
+    points: np.ndarray,
+    v0: np.ndarray,
+    v1: np.ndarray,
+    v2: np.ndarray,
+    tri_obj_ids: np.ndarray,
+    pair_budget: int = _POINT_TRIANGLE_PAIR_BUDGET,
+) -> np.ndarray:
+    """Assign each point to the ``object_id`` owning its nearest triangle.
+
+    Uses the exact point-to-triangle distance. Points are processed in chunks so
+    the transient ``(chunk, T, 3)`` arrays stay within ``pair_budget`` (point,
+    triangle) pairs, bounding peak memory regardless of scene size. The cost is
+    ``O(P x T)`` (interaction points x triangles): when both are large this is
+    heavier than the hull bbox-center heuristic, which is the deliberate
+    accuracy-vs-throughput trade-off of using the lossless mesh.
+
+    Args:
+        points: ``(P, 3)`` query points.
+        v0: ``(T, 3)`` first triangle vertices.
+        v1: ``(T, 3)`` second triangle vertices.
+        v2: ``(T, 3)`` third triangle vertices.
+        tri_obj_ids: ``(T,)`` owning object_id per triangle.
+        pair_budget: Maximum number of (point, triangle) pairs per chunk.
+
+    Returns:
+        ``(P,)`` int array with the owning object_id for each point.
+
+    """
+    n_points = len(points)
+    result = np.empty(n_points, dtype=tri_obj_ids.dtype)
+    n_tris = len(tri_obj_ids)
+    chunk = max(1, pair_budget // max(1, n_tris))
+    for start in range(0, n_points, chunk):
+        stop = start + chunk
+        dists = _point_triangle_distances(points[start:stop], v0, v1, v2)  # (c, T)
+        result[start:stop] = tri_obj_ids[np.argmin(dists, axis=1)]
+    return result
+
+
+# Peak bytes for the transient [chunk, n_centers, 3] distance tensor in `_nearest_center_idx`.
+_NEAREST_CENTER_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _nearest_center_idx(
+    points: np.ndarray, centers: np.ndarray, *, max_bytes: int = _NEAREST_CENTER_CHUNK_BYTES
+) -> np.ndarray:
+    """Index of the nearest center (by Euclidean distance) for each point.
+
+    Chunked over ``points`` so the transient ``[chunk, n_centers, 3]`` distance tensor
+    never exceeds ``max_bytes``. Ties resolve to the lowest index, matching ``np.argmin``.
+
+    Args:
+        points: Query points, shape ``[n_points, 3]``.
+        centers: Candidate centers, shape ``[n_centers, 3]``.
+        max_bytes: Memory budget for the per-chunk distance tensor.
+
+    Returns:
+        np.ndarray: Index into ``centers`` of the nearest center, shape ``[n_points]``.
+
+    """
+    n_points = points.shape[0]
+    nearest = np.empty(n_points, dtype=np.intp)
+    bytes_per_point = max(centers.shape[0] * centers.shape[1] * points.itemsize, 1)
+    chunk = max(1, int(max_bytes // bytes_per_point))
+    for start in range(0, n_points, chunk):
+        block = points[start : start + chunk]
+        dist = np.linalg.norm(centers[None, :, :] - block[:, None, :], axis=2)
+        nearest[start : start + chunk] = np.argmin(dist, axis=1)
+    return nearest
 
 
 class Dataset(DotDict):
@@ -311,7 +500,7 @@ class Dataset(DotDict):
                 delta_f = bandwidth / n_subcarriers
                 t_sym = 1.0 / delta_f
                 times = np.arange(int(num_timestamps), dtype=float) * t_sym
-        array_response_product = self._compute_array_response_product()
+        array_response_rx, array_response_tx = self._compute_array_responses()
         n_paths_to_gen = params.num_paths
         n_paths = np.min((n_paths_to_gen, self.delay.shape[-1]))
         default_doppler = np.zeros((self.n_ue, n_paths))
@@ -322,8 +511,11 @@ class Dataset(DotDict):
             if not use_doppler and params[c.PARAMSET_DOPPLER_EN]:
                 print("No doppler in channel generation because all velocities are zero")
         dopplers = self.doppler[..., :n_paths] if use_doppler else default_doppler
+        # Carry RX/TX responses separately; the M_rx x M_tx product is formed per-chunk
+        # inside the generator so the full product is never held for all users at once.
         channel = _generate_mimo_channel(
-            array_response_product=array_response_product[..., :n_paths],
+            array_response_rx=array_response_rx[..., :n_paths],
+            array_response_tx=array_response_tx[..., :n_paths],
             power=self._power_linear_ant_gain[..., :n_paths],
             delay=self.delay[..., :n_paths],
             phase=self.phase[..., :n_paths],
@@ -580,28 +772,83 @@ class Dataset(DotDict):
             phi: Azimuth angles array
 
         Returns:
-            Array response matrix
+            Array response matrix (complex64 to halve memory of the per-path responses)
 
         """
         kd = 2 * np.pi * ant_params.spacing
         ant_ind = _ant_indices(ant_params[c.PARAMSET_ANT_SHAPE])
-        return _array_response_batch(ant_ind=ant_ind, theta=theta, phi=phi, kd=kd)
+        return _array_response_batch(
+            ant_ind=ant_ind, theta=theta, phi=phi, kd=kd, dtype=np.complex64
+        )
+
+    def _compute_array_responses(self) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the separate RX and TX antenna array responses (complex64).
+
+        Returns the receive [n_ue, M_rx, P] and transmit [n_ue, M_tx, P] responses
+        *without* forming the memory-heavy [n_ue, M_rx, M_tx, P] outer product. The M_rx x
+        M_tx contraction is deferred to per-chunk channel generation.
+
+        Results are cached on the dataset and reused across repeated channel generations.
+        The cache is invalidated automatically when the antenna geometry (shape/spacing) or
+        the rotated angles change (the latter via object identity of the rotated-angle
+        arrays, which are themselves recomputed when their cache is cleared).
+
+        Returns:
+            Tuple ``(array_response_rx, array_response_tx)``.
+
+        """
+        bs_ant_params = self.ch_params.bs_antenna
+        ue_ant_params = self.ch_params.ue_antenna
+        aod_el = self[c.AOD_EL_ROT_PARAM_NAME]
+        aod_az = self[c.AOD_AZ_ROT_PARAM_NAME]
+        aoa_el = self[c.AOA_EL_ROT_PARAM_NAME]
+        aoa_az = self[c.AOA_AZ_ROT_PARAM_NAME]
+
+        cache_key = (
+            tuple(np.asarray(bs_ant_params[c.PARAMSET_ANT_SHAPE]).ravel().tolist()),
+            float(bs_ant_params[c.PARAMSET_ANT_SPACING]),
+            tuple(np.asarray(ue_ant_params[c.PARAMSET_ANT_SHAPE]).ravel().tolist()),
+            float(ue_ant_params[c.PARAMSET_ANT_SPACING]),
+            id(aod_el),
+            id(aod_az),
+            id(aoa_el),
+            id(aoa_az),
+        )
+        # Read the cache straight from the instance __dict__ (it is stored via
+        # object.__setattr__): the Dataset overrides __getattr__ to raise KeyError for
+        # unknown keys, which getattr(..., default) would not catch.
+        cache = self.__dict__.get("_array_response_cache")
+        if cache is not None and cache["key"] == cache_key:
+            return cache["rx"], cache["tx"]
+
+        array_response_tx = self._compute_single_array_response(bs_ant_params, aod_el, aod_az)
+        array_response_rx = self._compute_single_array_response(ue_ant_params, aoa_el, aoa_az)
+        object.__setattr__(
+            self,
+            "_array_response_cache",
+            {
+                "key": cache_key,
+                "rx": array_response_rx,
+                "tx": array_response_tx,
+                # Keep references to the rotated-angle arrays so their id() stays unique
+                # (prevents id reuse after the rotated-angle cache is cleared/recomputed).
+                "refs": (aod_el, aod_az, aoa_el, aoa_az),
+            },
+        )
+        return array_response_rx, array_response_tx
 
     def _compute_array_response_product(self) -> np.ndarray:
-        """Compute product of TX and RX array responses.
+        """Compute the full TX/RX array response product (legacy full-product form).
+
+        Prefer :meth:`_compute_array_responses` (separate RX/TX) for channel generation;
+        this method materializes the full [n_ue, M_rx, M_tx, P] product and is retained for
+        backward compatibility (e.g. ``dataset.array_response_product``).
 
         Returns:
             Array response product matrix
 
         """
-        tx_ant_params = self.ch_params.bs_antenna
-        rx_ant_params = self.ch_params.ue_antenna
-        array_response_tx = self._compute_single_array_response(
-            tx_ant_params, self[c.AOD_EL_ROT_PARAM_NAME], self[c.AOD_AZ_ROT_PARAM_NAME]
-        )
-        array_response_rx = self._compute_single_array_response(
-            rx_ant_params, self[c.AOA_EL_ROT_PARAM_NAME], self[c.AOA_AZ_ROT_PARAM_NAME]
-        )
+        array_response_rx, array_response_tx = self._compute_array_responses()
         return array_response_rx[:, :, None, :] * array_response_tx[:, None, :, :]
 
     def _is_full_fov(self, fov: np.ndarray) -> bool:
@@ -990,24 +1237,26 @@ class Dataset(DotDict):
         """
         m = mode.lower()
         if m == "active":
-            return self._get_active_idxs()
-        if m == "linear":
-            return self._get_linear_idxs(
+            result = self._get_active_idxs()
+        elif m == "linear":
+            result = self._get_linear_idxs(
                 kwargs["start_pos"],
                 kwargs["end_pos"],
                 kwargs["n_steps"],
                 filter_repeated=kwargs.get("filter_repeated", True),
             )
-        if m == "uniform":
-            return self._get_uniform_idxs(kwargs["steps"])
-        if m == "row":
-            return self._get_row_idxs(kwargs["row_idxs"])
-        if m == "col":
-            return self._get_col_idxs(kwargs["col_idxs"])
-        if m == "limits":
-            return get_idxs_with_limits(self.rx_pos, **kwargs)
-        msg = f"Unknown mode: {mode}"
-        raise ValueError(msg)
+        elif m == "uniform":
+            result = self._get_uniform_idxs(kwargs["steps"])
+        elif m == "row":
+            result = self._get_row_idxs(kwargs["row_idxs"])
+        elif m == "col":
+            result = self._get_col_idxs(kwargs["col_idxs"])
+        elif m == "limits":
+            result = get_idxs_with_limits(self.rx_pos, **kwargs)
+        else:
+            msg = f"Unknown mode: {mode}"
+            raise ValueError(msg)
+        return result
 
     def _trim_by_path(self, path_mask: np.ndarray) -> Dataset:
         """Trim paths based on a boolean mask.
@@ -1333,6 +1582,8 @@ class Dataset(DotDict):
 
     def plot_summary(self, **kwargs: Any) -> Any:
         """Plot the summary of the dataset."""
+        from deepmimo.datasets.summary import plot_summary  # noqa: PLC0415
+
         return plot_summary(dataset=self, **kwargs)
 
     @property
@@ -1606,26 +1857,35 @@ class Dataset(DotDict):
         )
         k_tx = spherical_to_cartesian(tx_coord_cat)
         k_rx = spherical_to_cartesian(rx_coord_cat)
-        k_i = self._compute_inter_angles()
-        inter_objects = self._compute_inter_objects()
-        for ue_i in tqdm(range(self.n_ue), desc="Computing doppler per UE"):
-            n_paths = self.num_paths[ue_i]
-            for path_i in range(n_paths):
-                if np.isnan(self.inter[ue_i, path_i]):
-                    continue
-                n_inter = self.num_interactions[ue_i, path_i]
-                tx_doppler = np.dot(k_tx[ue_i, path_i], self.tx_vel) / wavelength
-                rx_doppler = np.dot(k_rx[ue_i, path_i], self.rx_vel[ue_i]) / wavelength
-                path_dopplers = [0]
-                for i in range(int(n_inter)):
-                    inter_obj_idx = inter_objects[ue_i, path_i, i]
-                    if np.isnan(inter_obj_idx):
-                        continue
-                    v_i = self.scene.objects[int(inter_obj_idx)].vel
-                    ki_diff = k_i[ue_i, path_i, i + 1] - k_i[ue_i, path_i, i]
-                    path_dopplers += [np.dot(v_i, ki_diff) / wavelength]
-                doppler[ue_i, path_i] = tx_doppler - rx_doppler + np.sum(path_dopplers)
-        return doppler
+        k_i = self._compute_inter_angles()  # [n_ue, max_paths, max_inter+1, 3]
+        inter_objects = self._compute_inter_objects()  # [n_ue, max_paths, max_inter]
+
+        # k_i / inter_objects already use the (nanmax-derived) max_paths; match it here.
+        max_paths = self.max_paths
+        k_tx = k_tx[:, :max_paths, :]
+        k_rx = k_rx[:, :max_paths, :]
+
+        # TX/RX terms: dot(k, v) / wavelength for every (user, path).
+        tx_doppler = np.sum(k_tx * self.tx_vel, axis=-1) / wavelength
+        rx_doppler = np.sum(k_rx * self.rx_vel[:, None, :], axis=-1) / wavelength
+
+        # Interaction terms: sum_i dot(v_obj[i], k_{i+1} - k_i) / wavelength.
+        ki_diff = np.diff(k_i, axis=2)  # [n_ue, max_paths, max_inter, 3]
+        obj_mask = ~np.isnan(inter_objects)  # real interaction points only
+        obj_vel = np.array([obj.vel for obj in self.scene.objects])  # [n_objects, 3]
+        obj_idx = np.where(obj_mask, inter_objects, 0).astype(int)
+        v_obj = obj_vel[obj_idx]  # [n_ue, max_paths, max_inter, 3]
+        inter_doppler = np.where(obj_mask, np.sum(v_obj * ki_diff, axis=-1) / wavelength, 0.0)
+        inter_doppler = inter_doppler.sum(axis=2)
+
+        doppler = tx_doppler - rx_doppler + inter_doppler
+
+        # Original loop only visits paths with index < num_paths and a non-NaN code.
+        path_idx = np.arange(max_paths)
+        path_valid = (path_idx[None, :] < self.num_paths[:, None]) & ~np.isnan(
+            self.inter[:, :max_paths]
+        )
+        return np.where(path_valid, doppler, 0.0)
 
     def _compute_inter_angles(self) -> np.ndarray:
         """Compute the outgoing angles for all users and paths.
@@ -1639,20 +1899,41 @@ class Dataset(DotDict):
                         the unit vectors between interactions (x, y, z)
 
         """
-        inter_angles = np.zeros((self.n_ue, self.max_paths, self.max_inter + 1, 3))
-        for ue_i in tqdm(range(self.n_ue), desc="Computing interaction angles per UE"):
-            for path_i in range(self.max_paths):
-                n_inter = self.num_interactions[ue_i, path_i]
-                if np.isnan(n_inter) or n_inter == 0:
-                    continue
-                for i in range(-1, int(n_inter)):
-                    pos1 = self.tx_pos if i == -1 else self.inter_pos[ue_i, path_i, i]
-                    if i == n_inter - 1:
-                        pos2 = self.rx_pos[ue_i]
-                    else:
-                        pos2 = self.inter_pos[ue_i, path_i, i + 1]
-                    vec = pos2 - pos1
-                    inter_angles[ue_i, path_i, i + 1] = vec / np.linalg.norm(vec)
+        n_ue, max_paths, max_inter = self.n_ue, self.max_paths, self.max_inter
+        inter_angles = np.zeros((n_ue, max_paths, max_inter + 1, 3))
+
+        # `max_paths`/`max_inter` are nanmax-derived, so clip to the loop's index bounds.
+        n_inter = self.num_interactions[:, :max_paths]  # NaN when the path is empty
+        valid = ~np.isnan(n_inter) & (n_inter != 0)
+        if not valid.any():
+            return inter_angles
+        n_int = np.where(valid, n_inter, 0).astype(int)
+
+        tx_pos = np.reshape(np.asarray(self.tx_pos), CARTESIAN_DIM)
+        inter_pos = self.inter_pos[:, :max_paths, :max_inter, :]
+        rx_pos = self.rx_pos  # [n_ue, 3]
+
+        # Walk the chain tx_pos -> inter_pos[0] -> ... -> inter_pos[n-1] -> rx_pos.
+        # Segment s (stored at slot s) goes from pos1[s] to pos2[s].
+        pos1 = np.empty((n_ue, max_paths, max_inter + 1, CARTESIAN_DIM))
+        pos1[:, :, 0, :] = tx_pos
+        pos1[:, :, 1:, :] = inter_pos
+        pos2 = np.empty((n_ue, max_paths, max_inter + 1, CARTESIAN_DIM))
+        pos2[:, :, :max_inter, :] = inter_pos
+        pos2[:, :, max_inter, :] = 0.0  # placeholder; only read when n_inter == max_inter
+
+        # The final segment of every (valid) path terminates at the receiver.
+        ue_sel, path_sel = np.nonzero(valid)
+        pos2[ue_sel, path_sel, n_int[ue_sel, path_sel], :] = rx_pos[ue_sel]
+
+        vec = pos2 - pos1
+        with np.errstate(invalid="ignore", divide="ignore"):
+            unit = vec / np.linalg.norm(vec, axis=-1, keepdims=True)
+
+        # Fill slots 0..n_inter; deeper slots stay zero exactly like the loop skipped them.
+        slots = np.arange(max_inter + 1)
+        slot_mask = valid[:, :, None] & (slots[None, None, :] <= n_int[:, :, None])
+        inter_angles[slot_mask] = unit[slot_mask]
         return inter_angles
 
     def _compute_inter_objects(self) -> np.ndarray:
@@ -1662,12 +1943,28 @@ class Dataset(DotDict):
         Each object represents the object that the path interacts with.
         The objects are returned as the object index.
 
+        Assignment of a (non-terrain) interaction point to an object depends on
+        the loaded scene's geometry representation:
+
+        - Hull/legacy scenes (``scene.representation == "hull"``): the point is
+          assigned to the non-terrain object whose bounding-box *center* is
+          nearest. This is the long-standing heuristic and is left unchanged.
+        - Lossless mesh scenes (``scene.representation == "mesh"``): the point is
+          assigned to the object owning the nearest *triangular face* using the
+          exact point-to-triangle distance, which is substantially more accurate
+          than bounding-box centers (see ``_compute_inter_objects_mesh``).
+
+        The terrain z-snap behavior (assigning the terrain object when a point's
+        z is approximately the terrain top) is identical in both modes.
+
         Returns:
             np.ndarray: The objects that interact with each path of each user.
             Shape: [n_ue, max_paths, max_interactions]
 
         """
-        inter_obj_ids = np.zeros((self.n_ue, self.max_paths, self.max_inter)) * np.nan
+        n_ue, max_paths, max_inter = self.n_ue, self.max_paths, self.max_inter
+        inter_obj_ids = np.full((n_ue, max_paths, max_inter), np.nan)
+
         terrain_objs = [obj for obj in self.scene.objects if obj.label == "terrain"]
         if len(terrain_objs) > 1:
             msg = "There should be only one terrain object"
@@ -1675,8 +1972,72 @@ class Dataset(DotDict):
         terrain_obj = terrain_objs[0]
         terrain_z_coord = terrain_obj.bounding_box.z_max
         non_terrain_objs = [obj for obj in self.scene.objects if obj.label != "terrain"]
+        scene_repr = getattr(self.scene, c.SCENE_PARAM_REPRESENTATION, c.SCENE_REPRESENTATION_HULL)
+        if scene_repr == c.SCENE_REPRESENTATION_MESH:
+            return self._compute_inter_objects_mesh(
+                inter_obj_ids, terrain_obj, terrain_z_coord, non_terrain_objs
+            )
         obj_centers = np.array([obj.bounding_box.center for obj in non_terrain_objs])
         obj_ids = np.array([obj.object_id for obj in non_terrain_objs])
+
+        # Gather only the real interaction points (slot i < n_inter for non-empty paths).
+        # `max_paths`/`max_inter` are nanmax-derived, so clip to the loop's index bounds.
+        n_inter = self.num_interactions[:, :max_paths]
+        valid = ~np.isnan(n_inter) & (n_inter != 0)
+        n_int = np.where(valid, n_inter, 0).astype(int)
+        slots = np.arange(max_inter)
+        point_mask = valid[:, :, None] & (slots[None, None, :] < n_int[:, :, None])
+        if not point_mask.any():
+            return inter_obj_ids
+
+        pts = self.inter_pos[:, :max_paths, :max_inter, :][point_mask]  # [N, 3]
+        assigned = np.empty(pts.shape[0])
+
+        # Terrain z-snap short-circuits the nearest-object search, exactly like the loop.
+        is_terrain = np.isclose(pts[:, 2], terrain_z_coord, rtol=0, atol=0.001)
+        assigned[is_terrain] = terrain_obj.object_id
+
+        other = ~is_terrain
+        if other.any():
+            nearest = _nearest_center_idx(pts[other], obj_centers)
+            assigned[other] = obj_ids[nearest]
+
+        inter_obj_ids[point_mask] = assigned
+        return inter_obj_ids
+
+    def _compute_inter_objects_mesh(
+        self,
+        inter_obj_ids: np.ndarray,
+        terrain_obj: Any,
+        terrain_z_coord: float,
+        non_terrain_objs: list,
+    ) -> np.ndarray:
+        """Mesh-scene variant of :meth:`_compute_inter_objects`.
+
+        Each non-terrain interaction point is assigned to the object owning the
+        nearest *triangular face* using the exact point-to-triangle distance,
+        which is far more accurate than the hull bounding-box-center heuristic
+        when the lossless mesh geometry is available. Terrain points are still
+        resolved by the same z-snap test as the hull path.
+
+        The terrain z-snap loop mirrors the hull path so terrain assignment is
+        byte-identical; non-terrain points are gathered and assigned in a single
+        vectorized (chunked) pass over all triangular faces.
+
+        Args:
+            inter_obj_ids: Pre-allocated ``(n_ue, max_paths, max_inter)`` array
+                of NaNs to fill in place.
+            terrain_obj: The single terrain object (z-snap target).
+            terrain_z_coord: Terrain top z used for the z-snap test.
+            non_terrain_objs: Objects eligible for nearest-face assignment.
+
+        Returns:
+            np.ndarray: The filled ``inter_obj_ids`` array.
+
+        """
+        v0, v1, v2, tri_obj_ids = _gather_object_triangles(non_terrain_objs)
+        pending_points: list[np.ndarray] = []
+        pending_idx: list[tuple[int, int, int]] = []
         for ue_i in tqdm(range(self.n_ue), desc="Computing interaction objects per UE"):
             for path_i in range(self.max_paths):
                 n_inter = self.num_interactions[ue_i, path_i]
@@ -1687,9 +2048,14 @@ class Dataset(DotDict):
                     if np.isclose(i_pos[2], terrain_z_coord, rtol=0, atol=0.001):
                         inter_obj_ids[ue_i, path_i, i] = terrain_obj.object_id
                         continue
-                    dist = np.linalg.norm(obj_centers - i_pos, axis=1)
-                    obj_idx = np.argmin(dist)
-                    inter_obj_ids[ue_i, path_i, i] = obj_ids[obj_idx]
+                    pending_points.append(i_pos)
+                    pending_idx.append((ue_i, path_i, i))
+        if pending_points and len(tri_obj_ids) > 0:
+            nearest = _nearest_triangle_object_ids(
+                np.asarray(pending_points, dtype=float), v0, v1, v2, tri_obj_ids
+            )
+            for (ue_i, path_i, i), obj_id in zip(pending_idx, nearest, strict=True):
+                inter_obj_ids[ue_i, path_i, i] = obj_id
         return inter_obj_ids
 
     def clear_all_caches(self) -> None:
@@ -1798,6 +2164,253 @@ class Dataset(DotDict):
     }
 
 
+_MERGE_EXCLUDED_KEYS = {"n_ue", "grid_size", "grid_spacing", "txrx"}
+
+
+class MergedGridDataset(Dataset):
+    """Dataset wrapper that resolves global row/col indexing across merged RX grids."""
+
+    def __init__(self, data: dict[str, Any] | None = None, *, merge_spec: dict[str, Any]) -> None:
+        """Initialize a merged dataset with precomputed global grid metadata."""
+        super().__init__(data or {})
+        object.__setattr__(self, "_merge_spec", merge_spec)
+
+    def _resolve_global_grid_idxs(
+        self,
+        axis: str,
+        idxs: int | list[int] | np.ndarray,
+    ) -> np.ndarray:
+        """Resolve global merged-grid row/column indices into user indices."""
+        idxs_arr = np.asarray([idxs] if isinstance(idxs, int) else idxs, dtype=int).ravel()
+        if idxs_arr.size == 0:
+            return np.array([], dtype=int)
+
+        if axis == "row":
+            grid_offsets = np.asarray(self._merge_spec["row_offsets"], dtype=int)
+            grid_axes = self._merge_spec.get(
+                "row_axes",
+                ["row"] * len(self._merge_spec["grid_sizes"]),
+            )
+        elif axis == "col":
+            grid_offsets = np.asarray(self._merge_spec["col_offsets"], dtype=int)
+            grid_axes = self._merge_spec.get(
+                "col_axes",
+                ["col"] * len(self._merge_spec["grid_sizes"]),
+            )
+        else:
+            msg = f"Invalid axis '{axis}', must be 'row' or 'col'"
+            raise ValueError(msg)
+
+        if np.any(idxs_arr < 0) or np.any(idxs_arr >= grid_offsets[-1]):
+            msg = (
+                f"{axis}_idxs must be in range [0, {grid_offsets[-1]}), "
+                f"but got min={idxs_arr.min()}, max={idxs_arr.max()}"
+            )
+            raise IndexError(msg)
+
+        ue_offsets = np.asarray(self._merge_spec["ue_offsets"], dtype=int)
+        grid_sizes = [np.asarray(g, dtype=int) for g in self._merge_spec["grid_sizes"]]
+
+        grid_idxs = np.searchsorted(grid_offsets[1:], idxs_arr, side="right")
+        all_ue_idxs = []
+        for idx, grid_idx in zip(idxs_arr, grid_idxs, strict=False):
+            local_idx = int(idx - grid_offsets[grid_idx])
+            local_axis = grid_axes[grid_idx]
+            local_ue_idxs = get_grid_idxs(grid_sizes[grid_idx], local_axis, np.array([local_idx]))
+            all_ue_idxs.append(local_ue_idxs + ue_offsets[grid_idx])
+
+        return np.concatenate(all_ue_idxs).astype(int)
+
+    def _get_row_idxs(self, row_idxs: int | list[int] | np.ndarray) -> np.ndarray:
+        """Return indices of users in global merged rows."""
+        return self._resolve_global_grid_idxs("row", row_idxs)
+
+    def _get_col_idxs(self, col_idxs: int | list[int] | np.ndarray) -> np.ndarray:
+        """Return indices of users in global merged columns."""
+        return self._resolve_global_grid_idxs("col", col_idxs)
+
+
+def _pad_concat_users(arrays: list[np.ndarray]) -> np.ndarray:
+    """Pad per-user arrays to common non-user dimensions, then concatenate on axis 0."""
+    ndim = arrays[0].ndim
+    target_shape = [max(arr.shape[d] for arr in arrays) for d in range(1, ndim)]
+    padded_arrays = []
+    for arr in arrays:
+        arr_to_pad = arr
+        if np.issubdtype(arr_to_pad.dtype, np.integer) or np.issubdtype(arr_to_pad.dtype, np.bool_):
+            arr_to_pad = arr_to_pad.astype(np.float32)
+
+        pad_width = [(0, 0)] + [
+            (0, target_shape[d - 1] - arr_to_pad.shape[d]) for d in range(1, ndim)
+        ]
+        if np.issubdtype(arr_to_pad.dtype, np.complexfloating):
+            pad_value = np.nan + 0j
+        elif np.issubdtype(arr_to_pad.dtype, np.floating):
+            pad_value = np.nan
+        else:
+            pad_value = 0
+        padded_arrays.append(
+            np.pad(arr_to_pad, pad_width, mode="constant", constant_values=pad_value)
+        )
+    return np.concatenate(padded_arrays, axis=0)
+
+
+def _missing_user_array(n_ue: int, tail_shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    """Return a padded placeholder for a missing per-user array."""
+    array_dtype = np.dtype(dtype)
+    if np.issubdtype(array_dtype, np.integer) or np.issubdtype(array_dtype, np.bool_):
+        array_dtype = np.dtype(np.float32)
+
+    if np.issubdtype(array_dtype, np.complexfloating):
+        fill_value = np.nan + 0j
+    elif np.issubdtype(array_dtype, np.floating):
+        fill_value = np.nan
+    else:
+        fill_value = 0
+    return np.full((n_ue, *tail_shape), fill_value, dtype=array_dtype)
+
+
+def _merged_grid_spec(
+    datasets: list[Dataset],
+    *,
+    row_axes: list[str] | None = None,
+    col_axes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build global row/col indexing metadata for merged multi-grid datasets."""
+    grid_sizes = [np.asarray(ds.grid_size, dtype=int) for ds in datasets]
+    ue_offsets = np.cumsum([0, *[int(ds.n_ue) for ds in datasets[:-1]]], dtype=int)
+    resolved_row_axes = ["row"] * len(datasets) if row_axes is None else list(row_axes)
+    resolved_col_axes = ["col"] * len(datasets) if col_axes is None else list(col_axes)
+    if len(resolved_row_axes) != len(datasets) or len(resolved_col_axes) != len(datasets):
+        msg = "Merged-grid axis overrides must match the number of datasets."
+        raise ValueError(msg)
+
+    n_rows_per_grid = [
+        int(grid_size[1]) if row_axis == "row" else int(grid_size[0])
+        for grid_size, row_axis in zip(grid_sizes, resolved_row_axes, strict=False)
+    ]
+    n_cols_per_grid = [
+        int(grid_size[0]) if col_axis == "col" else int(grid_size[1])
+        for grid_size, col_axis in zip(grid_sizes, resolved_col_axes, strict=False)
+    ]
+    return {
+        "ue_offsets": ue_offsets,
+        "grid_sizes": grid_sizes,
+        "row_axes": resolved_row_axes,
+        "col_axes": resolved_col_axes,
+        "row_offsets": np.cumsum([0, *n_rows_per_grid], dtype=int),
+        "col_offsets": np.cumsum([0, *n_cols_per_grid], dtype=int),
+    }
+
+
+def merge_datasets(  # noqa: C901, PLR0912
+    datasets: list[Dataset],
+    *,
+    row_axes: list[str] | None = None,
+    col_axes: list[str] | None = None,
+) -> Dataset:
+    """Merge datasets that share one transmitter into an explicit merged-grid dataset."""
+    if not datasets:
+        msg = "Cannot merge an empty dataset list"
+        raise ValueError(msg)
+
+    if len(datasets) == 1 and row_axes is None and col_axes is None:
+        return datasets[0]
+
+    tx_keys = {
+        (
+            int(dataset.get("txrx", {}).get("tx_set_id", -1)),
+            int(dataset.get("txrx", {}).get("tx_idx", -1)),
+        )
+        for dataset in datasets
+    }
+    rx_set_ids = {int(dataset.get("txrx", {}).get("rx_set_id", -1)) for dataset in datasets}
+    if len(tx_keys) != 1:
+        if len(rx_set_ids) == 1:
+            msg = (
+                "Merging datasets across multiple transmitters is not supported yet because "
+                "Dataset operations assume a single transmitter view."
+            )
+            raise NotImplementedError(msg)
+        msg = "Selected datasets must share the same transmitter or the same receiver grid"
+        raise ValueError(msg)
+
+    merged_data: dict[str, Any] = {}
+    keys: list[str] = []
+    seen: set[str] = set()
+    for dataset in datasets:
+        for key in dataset:
+            if key in _MERGE_EXCLUDED_KEYS or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+
+    for key in keys:
+        present_values = [dataset[key] for dataset in datasets if dataset.hasattr(key)]
+        present_datasets = [dataset for dataset in datasets if dataset.hasattr(key)]
+        if not present_values:
+            continue
+        first_value = present_values[0]
+
+        is_per_user_array = (
+            isinstance(first_value, np.ndarray)
+            and first_value.ndim > 0
+            and all(
+                isinstance(value, np.ndarray) and value.ndim == first_value.ndim
+                for value in present_values
+            )
+            and all(
+                value.shape[0] == dataset.n_ue
+                for value, dataset in zip(present_values, present_datasets, strict=False)
+            )
+        )
+
+        if len(present_values) != len(datasets):
+            if is_per_user_array:
+                tail_shape = tuple(
+                    max(value.shape[dim] for value in present_values)
+                    for dim in range(1, first_value.ndim)
+                )
+                aligned_values = []
+                for dataset in datasets:
+                    if dataset.hasattr(key):
+                        aligned_values.append(dataset[key])
+                    else:
+                        aligned_values.append(
+                            _missing_user_array(int(dataset.n_ue), tail_shape, first_value.dtype)
+                        )
+                merged_data[key] = _pad_concat_users(aligned_values)
+            else:
+                merged_data[key] = first_value
+            continue
+
+        if is_per_user_array:
+            same_tail_shapes = all(
+                value.shape[1:] == present_values[0].shape[1:] for value in present_values
+            )
+            if same_tail_shapes:
+                merged_data[key] = np.concatenate(present_values, axis=0)
+            else:
+                merged_data[key] = _pad_concat_users(present_values)
+        else:
+            merged_data[key] = first_value
+
+    merged_data["txrx_parts"] = [
+        dict(dataset.txrx) for dataset in datasets if dataset.hasattr("txrx")
+    ]
+    if datasets[0].hasattr("txrx"):
+        merged_data["txrx"] = dict(datasets[0].txrx)
+
+    return MergedGridDataset(
+        merged_data,
+        merge_spec=_merged_grid_spec(
+            datasets,
+            row_axes=row_axes,
+            col_axes=col_axes,
+        ),
+    )
+
+
 class MacroDataset:
     """Container holding multiple datasets and propagating operations to each.
 
@@ -1864,21 +2477,53 @@ class MacroDataset:
         results = [getattr(dataset, name) for dataset in self.datasets]
         return results[0] if len(results) == 1 else results
 
+    def _subset(self, idxs: list[int]) -> MacroDataset:
+        """Return a MacroDataset view preserving the requested dataset order."""
+        subset_datasets = [self.datasets[idx] for idx in idxs]
+        if isinstance(self, DynamicDataset):
+            subset = DynamicDataset(subset_datasets, self.name)
+            if hasattr(self, "timestamps"):
+                subset.timestamps = np.asarray(self.timestamps)[idxs]
+            return subset
+
+        subset = MacroDataset(subset_datasets)
+        for attr, value in self.__dict__.items():
+            if attr != "datasets":
+                setattr(subset, attr, value)
+        return subset
+
+    def _normalize_dataset_indices(self, idx: Any) -> list[int]:
+        """Normalize multi-index selection into an ordered list of dataset indices."""
+        if isinstance(idx, tuple):
+            idx = list(idx)
+        if isinstance(idx, list):
+            return [int(i) for i in idx]
+        if isinstance(idx, np.ndarray):
+            if idx.dtype == bool:
+                return np.flatnonzero(idx).tolist()
+            return np.asarray(idx, dtype=int).ravel().tolist()
+        msg = "MacroDataset indices must be int, slice, str, or an ordered collection of integers"
+        raise TypeError(msg)
+
     def __getitem__(self, idx: Any) -> Any:
-        """Get dataset at specified index if idx is integer, otherwise propagate to all datasets.
+        """Get one dataset, a dataset subset, or a propagated attribute.
 
         Args:
-            idx: Integer index to get specific dataset, or string key to get attribute
-                from all datasets
+            idx: Integer index to get a specific dataset, slice/sequence of indices to
+                get a MacroDataset subset, or string key to get an attribute from all
+                datasets.
 
         Returns:
-            Dataset instance if idx is integer,
-            single value if idx is in SHARED_PARAMS or if there is only one dataset,
-            or list of results if idx is string and there are multiple datasets
+            Dataset instance if idx is integer, MacroDataset subset if idx selects
+            multiple datasets, or propagated attribute values for string keys.
 
         """
-        if isinstance(idx, (int, slice)):
-            return self.datasets[idx]
+        if isinstance(idx, (int, np.integer)):
+            return self.datasets[int(idx)]
+        if isinstance(idx, slice):
+            return self._subset(list(range(*idx.indices(len(self.datasets)))))
+        if isinstance(idx, (tuple, list, np.ndarray)):
+            return self._subset(self._normalize_dataset_indices(idx))
         if idx in SHARED_PARAMS:
             return self._get_single(idx)
         results = [dataset[idx] for dataset in self.datasets]
@@ -1907,6 +2552,19 @@ class MacroDataset:
 
         """
         self.datasets.append(dataset)
+
+    def merge(self) -> Dataset:
+        """Merge selected datasets into one explicit merged-grid dataset.
+
+        The selected datasets must currently share the same transmitter. The merge
+        preserves the caller-provided dataset order and creates global row/column
+        indexing across the merged receiver grids.
+
+        Returns:
+            Dataset: The merged dataset view.
+
+        """
+        return merge_datasets(self.datasets)
 
     def to_binary(self, output_dir: str = "./datasets") -> None:
         """Export all datasets to binary format for web visualizer.
